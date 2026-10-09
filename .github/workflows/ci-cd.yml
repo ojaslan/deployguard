@@ -1,0 +1,70 @@
+name: CI-CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  EB_APP: deployguard
+  EB_ENV: deployguard-env
+  EB_REGION: ap-south-1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build backend image
+        run: docker build -t deployguard .
+      - name: Build dashboard image
+        run: docker build -f Dockerfile.dashboard -t deployguard-dashboard .
+      - name: Run backend container and check /health
+        run: |
+          docker run -d --name dg -p 8000:8000 deployguard
+          for i in $(seq 1 20); do curl -fs localhost:8000/health && break; sleep 2; done
+          curl -fs localhost:8000/health
+          docker rm -f dg
+
+  # Deploys only on manual run, or on push to main when the repo variable AUTO_DEPLOY = true.
+  # Needs repo secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [test, docker-build]
+    if: github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && vars.AUTO_DEPLOY == 'true')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.EB_REGION }}
+      - name: Package
+        run: zip -r deploy.zip app Procfile requirements.txt -x "*__pycache__*" "app/deployment_history.json"
+      - name: Upload and deploy to Elastic Beanstalk
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET=elasticbeanstalk-$EB_REGION-$ACCOUNT
+          LABEL=gh-${GITHUB_SHA::8}-${GITHUB_RUN_NUMBER}
+          aws s3 cp deploy.zip s3://$BUCKET/$EB_APP/$LABEL.zip
+          aws elasticbeanstalk create-application-version --application-name $EB_APP \
+            --version-label $LABEL --source-bundle S3Bucket=$BUCKET,S3Key=$EB_APP/$LABEL.zip
+          aws elasticbeanstalk update-environment --environment-name $EB_ENV --version-label $LABEL
+          aws elasticbeanstalk wait environment-updated --environment-names $EB_ENV
+      - name: Smoke test /health
+        run: |
+          CNAME=$(aws elasticbeanstalk describe-environments --environment-names $EB_ENV \
+            --query 'Environments[0].CNAME' --output text)
+          curl -fsS --retry 5 --retry-delay 5 http://$CNAME/health
